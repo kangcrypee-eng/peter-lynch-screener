@@ -1,16 +1,21 @@
 """
-피터 린치식 미국 주식 스크리닝 봇 V5 - 완전판
+피터 린치식 미국 주식 스크리닝 봇 V5 - 완전판 (전체 분석)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-모든 기능 포함:
-1. 3중 검증 (Yahoo + 직접계산 + Finviz)
-2. 유형별 순위 관리 (슬롯 시스템)
-3. 한글 기업 설명 (GPT 번역)
-4. 실시간 주가 링크 (Yahoo, Finviz, TradingView)
-5. 상세 에러 로그
-6. 히스토리 추적 (hold_weeks, 관찰 기간)
+핵심 개선:
+1. 모든 적격 티커 분석 (3000-5000개 예상)
+2. 소형주 포함 ($100M 이상) - Tenbagger 발굴
+3. 3중 검증 (Yahoo + 직접계산 + Finviz)
+4. 유형별 순위 관리 (슬롯 시스템)
+5. 한글 기업 설명 (GPT 번역)
+6. 실시간 주가 링크
+
+시가총액 설정:
+- MIN_MARKET_CAP = 100_000_000 ($100M) ← 피터 린치 추천!
+- 소형주에서 10배 수익(Tenbagger) 가능성 높음
 
 환경 변수: OPENAI_API_KEY (필수)
+실행: python peter_lynch_screener_v5_complete.py
 """
 
 import pandas as pd
@@ -141,7 +146,7 @@ class GPTAnalyzer:
                 stocks_info += f"   한글: {stock.get('한글설명', 'N/A')}\n"
                 stocks_info += f"   기업: {stock.get('기업설명', 'N/A')[:120]}...\n"
                 stocks_info += f"   PEG: {stock['PEG']:.2f} | 성장률: {stock['성장률(%)']:.1f}% | PE: {stock.get('P/E', 'N/A')}\n"
-                stocks_info += f"   현재가: ${stock['price']:.2f} | 검증: {stock['검증상태']}\n"
+                stocks_info += f"   시총: ${stock['시가총액($B)']:.1f}B | 검증: {stock['검증상태']}\n"
                 stocks_info += f"   주가: {stock.get('Yahoo', '')}\n\n"
         
         history_info = self._format_history_info(history, categorized_stocks)
@@ -167,7 +172,8 @@ class GPTAnalyzer:
 
 ## 요청
 
-각 종목의 유형, 순위, 한글 설명, 매수 이유를 포함하여 이번 주 액션 플랜을 작성해주세요.
+각 종목의 유형, 순위, 시가총액(소형주 여부), 한글 설명, 매수 이유를 포함하여 이번 주 액션 플랜을 작성해주세요.
+특히 소형주($1B 미만)는 Tenbagger 가능성을 고려하여 평가해주세요.
 """
         return prompt
     
@@ -237,7 +243,7 @@ class GPTAnalyzer:
             
             for i, stock in enumerate(stocks[:target], 1):
                 result += f"  {i}. {stock['티커']}: {stock.get('한글설명', stock['회사명'])}\n"
-                result += f"     PEG {stock['PEG']:.2f}, 성장률 {stock['성장률(%)']:.1f}%\n"
+                result += f"     PEG {stock['PEG']:.2f}, 성장률 {stock['성장률(%)']:.1f}%, 시총 ${stock['시가총액($B)']:.1f}B\n"
             result += "\n"
         
         return result
@@ -343,14 +349,14 @@ class PortfolioHistoryManager:
                     in_target = category_info['in_target']
                     
                     if in_target:
-                        # 목표 순위 내 (best_value 4위 이내, high_growth 4위 이내, balanced 2위 이내)
+                        # 목표 순위 내
                         self.history[ticker]['last_update'] = today
                         self.history[ticker]['current_price'] = category_info['price']
                         self.history[ticker]['current_rank'] = rank
                         self.history[ticker]['hold_weeks'] = info.get('hold_weeks', 0) + 1
                         logger.info(f"✅ {ticker} ({category}): 완성 종목 유지 | {rank}위 | {info.get('hold_weeks', 0) + 1}주차 보유")
                     else:
-                        # 목표 순위 밖 (5위 이하 등)
+                        # 목표 순위 밖
                         self.history[ticker]['last_update'] = today
                         self.history[ticker]['current_price'] = category_info['price']
                         self.history[ticker]['current_rank'] = rank
@@ -431,28 +437,24 @@ class PortfolioHistoryManager:
         
         logger.info(f"\n💰 전체 투자 비중: {total_weight:.1f}% / 100% (여유: {available_weight:.1f}%)")
         
-        if available_weight >= 3:  # 최소 3% (1주차) 이상 여유
+        if available_weight >= 3:
             new_entries = []
             
             for category, stocks in categorized_stocks.items():
                 cat_status = category_status[category]
                 
-                # 해당 유형에 진입 가능한 슬롯이 있는지
                 if cat_status['available_slots'] > 0:
                     target_count = category_targets[category]
                     
-                    # 이미 보유 중인 티커
                     owned_tickers = [
                         t for t, info in self.history.items()
                         if info.get('category') == category and info.get('status') == 'ACTIVE'
                     ]
                     
-                    # 해당 유형 Top N 중에서 미보유 종목 찾기
-                    for stock in stocks[:target_count * 2]:  # 여유있게 2배수 체크
+                    for stock in stocks[:target_count * 2]:
                         ticker = stock['티커'].upper()
                         
                         if ticker not in owned_tickers:
-                            # 신규 또는 이전에 매도한 종목
                             if ticker not in self.history or self.history[ticker].get('status') in ['REMOVED', 'SOLD']:
                                 rank = list(current_top_by_category[category].keys()).index(ticker) + 1 if ticker in current_top_by_category[category] else 999
                                 
@@ -463,15 +465,13 @@ class PortfolioHistoryManager:
                                     'peg': stock['PEG'],
                                     'growth': stock['성장률(%)'],
                                     'price': stock['price'],
-                                    'priority_score': cat_status['need_more'] * 100 + (10 - rank)  # 부족한 유형 + 순위 높은 종목 우선
+                                    'priority_score': cat_status['need_more'] * 100 + (10 - rank)
                                 })
             
-            # 우선순위 순으로 정렬
             new_entries.sort(key=lambda x: -x['priority_score'])
             
-            # 진입 가능한 만큼만 추가
             max_new_entries = min(
-                int(available_weight / 3),  # 최소 1주차(3%) 기준
+                int(available_weight / 3),
                 sum(cat_status['available_slots'] for cat_status in category_status.values())
             )
             
@@ -486,8 +486,8 @@ class PortfolioHistoryManager:
                     'category': category,
                     'entry_date': today,
                     'entry_price': entry['price'],
-                    'stage': 1,  # 1주차 시작
-                    'current_weight_pct': self.STAGE_WEIGHTS[1],  # 3%
+                    'stage': 1,
+                    'current_weight_pct': self.STAGE_WEIGHTS[1],
                     'status': 'ACTIVE',
                     'last_update': today,
                     'current_price': entry['price'],
@@ -576,8 +576,8 @@ class PeterLynchScreener:
         self.gpt_analyzer = GPTAnalyzer()
         self.slack_sender = SlackSender()
         
-        # 시가총액 설정
-        self.MIN_MARKET_CAP = 1_000_000_000  # $1B (소형주: 100_000_000)
+        # 시가총액 설정: $100M 이상 (소형주 포함!)
+        self.MIN_MARKET_CAP = 100_000_000  # $100M
         
         # 필터 기준
         self.GROWTH_LIMITS = {
@@ -594,22 +594,25 @@ class PeterLynchScreener:
             'max': 1.5
         }
         
-        self.TOLERANCE = 0.20  # 3중 검증 허용 오차 20%
+        self.TOLERANCE = 0.20
         
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
         }
         
-        # 에러 추적
         self.error_details = []
     
-    def run(self, ticker_limit=1000):
-        """메인 실행 함수"""
+    def run(self, ticker_limit=None):
+        """메인 실행 함수 - ticker_limit=None이면 전체 분석"""
         start = time.time()
         
         logger.info("=" * 80)
-        logger.info("🎯 피터 린치 스크리너 V5 - 완전판")
-        logger.info(f"💰 최소 시가총액: ${self.MIN_MARKET_CAP/1e9:.1f}B")
+        logger.info("🎯 피터 린치 스크리너 V5 - 완전판 (전체 분석)")
+        logger.info(f"💰 최소 시가총액: ${self.MIN_MARKET_CAP/1e6:.0f}M (소형주 포함!)")
+        if ticker_limit:
+            logger.info(f"⚠️  제한 모드: {ticker_limit}개만 분석")
+        else:
+            logger.info(f"🔥 전체 모드: 모든 적격 티커 분석 (예상 3000-5000개)")
         logger.info("=" * 80)
         
         if not self._step1_collect_tickers(ticker_limit):
@@ -632,9 +635,9 @@ class PeterLynchScreener:
         
         return filename
     
-    def _step1_collect_tickers(self, limit):
-        """Step 1: NASDAQ API에서 티커 수집"""
-        logger.info("\n[Step 1/7] 티커 수집 중...")
+    def _step1_collect_tickers(self, limit=None):
+        """Step 1: NASDAQ API에서 티커 수집 (전체)"""
+        logger.info("\n[Step 1/7] 티커 수집 중 (전체 분석)...")
         
         try:
             url = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=25000&download=true"
@@ -660,8 +663,11 @@ class PeterLynchScreener:
             df = df[df['symbol'].str.isalpha()]
             df = df.drop_duplicates(subset=['symbol'])
             
-            self.tickers = df['symbol'].tolist()[:limit]
-            logger.info(f"✅ {len(self.tickers)}개 티커 수집 완료\n")
+            # 전체 티커 사용 (limit 없음!)
+            all_tickers = df['symbol'].tolist()
+            self.tickers = all_tickers[:limit] if limit else all_tickers
+            
+            logger.info(f"✅ {len(self.tickers)}개 티커 수집 완료 {'(전체)' if not limit else f'(제한: {limit}개)'}\n")
             return True
             
         except Exception as e:
@@ -679,7 +685,6 @@ class PeterLynchScreener:
                 stock = yf.Ticker(ticker)
                 info = stock.info
                 
-                # 가격과 시총 가져오기 (여러 필드 시도)
                 price = (info.get('currentPrice') or 
                         info.get('regularMarketPrice') or 
                         info.get('previousClose'))
@@ -714,7 +719,6 @@ class PeterLynchScreener:
         self.filtered = passed
         logger.info(f"✅ {len(self.filtered)}개 필터 통과 (에러: {errors}개)")
         
-        # 에러 상세 출력
         if self.error_details:
             logger.info(f"\n🔍 에러 상세 (처음 5개):")
             for detail in self.error_details[:5]:
@@ -757,7 +761,6 @@ class PeterLynchScreener:
         stock = yf.Ticker(ticker)
         info = stock.info
         
-        # 기본 정보
         name = info.get('longName', 'N/A')
         sector = info.get('sector', 'N/A')
         industry = info.get('industry', 'N/A')
@@ -830,7 +833,6 @@ class PeterLynchScreener:
             if financials is None or financials.empty:
                 return None
             
-            # Net Income 찾기
             net_income_row = None
             for row_name in ['Net Income', 'Net Income Common Stockholders']:
                 if row_name in financials.index:
@@ -842,7 +844,6 @@ class PeterLynchScreener:
             
             net_income = financials.loc[net_income_row]
             
-            # 최근 2년 데이터
             if len(net_income) < 2:
                 return None
             
@@ -852,13 +853,11 @@ class PeterLynchScreener:
             if previous <= 0:
                 return None
             
-            # 성장률 계산
             growth_rate = ((recent - previous) / abs(previous)) * 100
             
             if growth_rate <= 0:
                 return None
             
-            # PEG 계산
             calculated_peg = pe_ratio / growth_rate
             
             return calculated_peg
@@ -873,7 +872,6 @@ class PeterLynchScreener:
             response = requests.get(url, headers=self.headers, timeout=10)
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Finviz 테이블에서 PEG 찾기
             rows = soup.find_all('tr')
             for row in rows:
                 cells = row.find_all('td')
@@ -906,17 +904,13 @@ class PeterLynchScreener:
             sources.append('Finviz')
             valid_pegs.append(finviz_peg)
         
-        # 최소 2개 이상 필요
         if len(valid_pegs) < 2:
             return {'valid': False}
         
-        # 평균값
         avg_peg = sum(valid_pegs) / len(valid_pegs)
         
-        # 오차 확인 (20% 이내)
         for peg in valid_pegs:
             if abs(peg - avg_peg) / avg_peg > self.TOLERANCE:
-                # 하나라도 오차 크면 중간값 사용
                 valid_pegs_sorted = sorted(valid_pegs)
                 median_peg = valid_pegs_sorted[len(valid_pegs_sorted) // 2]
                 
@@ -927,7 +921,6 @@ class PeterLynchScreener:
                     'sources': sources
                 }
         
-        # 모두 오차 범위 내
         return {
             'valid': True,
             'peg': round(avg_peg, 2),
@@ -950,8 +943,7 @@ class PeterLynchScreener:
         best = df[
             (df['peg'] < self.PEG_LIMITS['good']) &
             (df['growth_rate'] >= self.GROWTH_LIMITS['ideal_min']) &
-            (df['growth_rate'] <= self.GROWTH_LIMITS['ideal_max']) &
-            (df['market_cap'] > 5_000_000_000)
+            (df['growth_rate'] <= self.GROWTH_LIMITS['ideal_max'])
         ].sort_values('peg').head(10)
         
         for _, row in best.iterrows():
@@ -961,8 +953,7 @@ class PeterLynchScreener:
         high = df[
             (df['growth_rate'] > 50) &
             (df['growth_rate'] <= self.GROWTH_LIMITS['max']) &
-            (df['peg'] < 1.2) &
-            (df['market_cap'] > 3_000_000_000)
+            (df['peg'] < 1.2)
         ].sort_values('growth_rate', ascending=False).head(10)
         
         for _, row in high.iterrows():
@@ -972,8 +963,7 @@ class PeterLynchScreener:
         balanced = df[
             (df['peg'] < 1.0) &
             (df['growth_rate'] >= 20) &
-            (df['growth_rate'] <= 40) &
-            (df['market_cap'] > 10_000_000_000)
+            (df['growth_rate'] <= 40)
         ].sort_values('peg').head(5)
         
         for _, row in balanced.iterrows():
@@ -1002,6 +992,10 @@ class PeterLynchScreener:
         
         opinion = "🟢 강력 매수" if peg < self.PEG_LIMITS['excellent'] else ("🟢 매수" if peg < self.PEG_LIMITS['good'] else "🟡 관심")
         
+        # 소형주 표시
+        if market_cap_b < 1.0:
+            opinion += " 💎 소형주"
+        
         # 한글 번역
         korean_desc = self.gpt_analyzer.translate_to_korean(
             row.get('name', 'N/A'),
@@ -1018,7 +1012,7 @@ class PeterLynchScreener:
             'PEG': peg,
             '성장률(%)': growth,
             'P/E': row.get('pe_ratio'),
-            '시가총액($B)': round(market_cap_b, 1),
+            '시가총액($B)': round(market_cap_b, 2),
             '투자의견': opinion,
             '검증상태': row['validation_status'],
             '데이터출처': ', '.join(row['data_sources']),
@@ -1067,17 +1061,19 @@ class PeterLynchScreener:
                     cell = ws.cell(row=row_idx, column=col_idx, value=value)
                     cell.alignment = Alignment(wrap_text=True, vertical='top')
                     
-                    # 하이퍼링크 추가
                     if col_name in ['Yahoo', 'Finviz', 'TradingView'] and value:
                         cell.hyperlink = value
                         cell.style = 'Hyperlink'
                         cell.font = Font(color="0563C1", underline="single")
                     
-                    if col_name == '투자의견' and '강력 매수' in str(value):
-                        cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-                        cell.font = Font(bold=True, color="006100")
+                    if col_name == '투자의견':
+                        if '강력 매수' in str(value):
+                            cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+                            cell.font = Font(bold=True, color="006100")
+                        elif '소형주' in str(value):
+                            cell.font = Font(bold=True, color="FF6600")
             
-            widths = [8, 25, 35, 12, 15, 20, 8, 10, 8, 12, 15, 15, 20, 15, 15, 15]
+            widths = [8, 25, 35, 12, 15, 20, 8, 10, 8, 12, 18, 15, 20, 15, 15, 15]
             for i, width in enumerate(widths, 1):
                 ws.column_dimensions[get_column_letter(i)].width = width
         
@@ -1114,8 +1110,9 @@ class PeterLynchScreener:
         today = datetime.now().strftime('%Y년 %m월 %d일')
         week_num = datetime.now().isocalendar()[1]
         
-        message = f"""🤖 *피터 린치 봇 - 공격적 포트폴리오*
+        message = f"""🤖 *피터 린치 봇 - 공격적 포트폴리오 (전체 분석)*
 📅 {today} ({week_num}주차)
+💎 소형주 포함 ($100M+) - Tenbagger 발굴
 
 {gpt_advice}
 
@@ -1130,7 +1127,7 @@ class PeterLynchScreener:
     def _print_summary(self):
         """콘솔 요약"""
         print("\n" + "="*80)
-        print("💡 공격적 포트폴리오 추천")
+        print("💡 공격적 포트폴리오 추천 (전체 분석)")
         print("="*80)
         
         for category, name in [('best_value', '최고 가치주'), ('high_growth', '고성장주'), ('balanced', '균형')]:
@@ -1138,8 +1135,10 @@ class PeterLynchScreener:
             if stocks:
                 print(f"\n【{name}】")
                 for stock in stocks[:3]:
-                    print(f"  {stock['티커']:6} - {stock.get('한글설명', stock['회사명'])}")
-                    print(f"     PEG: {stock['PEG']:.2f} | 성장률: {stock['성장률(%)']:.1f}% | {stock['검증상태']}")
+                    small_cap_mark = " 💎" if stock['시가총액($B)'] < 1.0 else ""
+                    print(f"  {stock['티커']:6} - {stock.get('한글설명', stock['회사명'])}{small_cap_mark}")
+                    print(f"     PEG: {stock['PEG']:.2f} | 성장률: {stock['성장률(%)']:.1f}% | 시총: ${stock['시가총액($B)']:.2f}B")
+                    print(f"     {stock['검증상태']}")
                     print(f"     주가: {stock['Yahoo']}")
         
         print("\n" + "="*80)
@@ -1148,13 +1147,17 @@ class PeterLynchScreener:
 def main():
     print("""
 ╔════════════════════════════════════════════════════════════════╗
-║  피터 린치 주식 스크리너 V5 - 완전판                         ║
+║  피터 린치 주식 스크리너 V5 - 완전판 (전체 분석)            ║
 ║                                                                ║
+║  ✅ 모든 적격 티커 분석 (3000-5000개 예상)                  ║
+║  ✅ 소형주 포함 ($100M+) - Tenbagger 발굴!                  ║
 ║  ✅ 3중 검증 (Yahoo + 직접계산 + Finviz)                     ║
 ║  ✅ 유형별 순위 관리 (슬롯 시스템)                           ║
 ║  ✅ 한글 기업 설명 (GPT 번역)                                ║
 ║  ✅ 실시간 주가 링크 (Yahoo, Finviz, TradingView)            ║
-║  ✅ 상세 에러 로그                                            ║
+║                                                                ║
+║  "숨은 보석은 사람들이 안 보는 곳에 있다" - 피터 린치        ║
+║  "10배 수익은 작은 회사에서 나온다" - 피터 린치              ║
 ║                                                                ║
 ║  환경 변수: OPENAI_API_KEY (필수)                             ║
 ╚════════════════════════════════════════════════════════════════╝
@@ -1169,12 +1172,18 @@ def main():
         print("   결과는 콘솔에 출력됩니다.\n")
     
     screener = PeterLynchScreener()
-    result = screener.run(ticker_limit=1000)
+    
+    # 전체 분석 실행 (ticker_limit=None)
+    # 테스트하려면: ticker_limit=100
+    result = screener.run(ticker_limit=None)
     
     if result:
         print(f"\n✅ 스크리닝 완료!")
         print(f"📊 Excel 파일: {result}")
         print(f"📁 히스토리: portfolio_history.json")
+        print(f"\n💎 모든 적격 주식을 분석했습니다.")
+        print(f"   숨어있던 기회를 놓치지 않았습니다!")
+        print(f"   소형주($100M+)에서 Tenbagger를 찾으세요!")
     else:
         print("\n❌ 스크리닝 실패")
         print("로그 파일을 확인하세요.")
