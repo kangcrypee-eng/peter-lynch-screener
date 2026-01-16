@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# API Keys & Secrets
+.env
+*.log
+
+# Excel outputs (로컬만)
+Peter_Lynch_Report_*.xlsx
+
+# MacOS
+.DS_Store
+
+# VSCode
+.vscode/
+
+# 로컬 테스트용만 제외 (GitHub Actions는 커밋함)
+# portfolio_history.json은 Git에 포함

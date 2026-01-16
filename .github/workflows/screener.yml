@@ -1,0 +1,65 @@
+name: Peter Lynch Screener
+
+on:
+  schedule:
+    # 매주 월요일 오전 9시 (한국시간 기준 오후 6시)
+    - cron: '0 0 * * 1'
+  workflow_dispatch:  # 수동 실행 가능
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 체크아웃
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Python 설정
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: 의존성 설치
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: 히스토리 파일 복원
+      run: |
+        if [ -f portfolio_history.json ]; then
+          echo "히스토리 파일 발견"
+        else
+          echo "{}" > portfolio_history.json
+          echo "새 히스토리 파일 생성"
+        fi
+    
+    - name: 스크리너 실행
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+      run: |
+        python peter_lynch_screener_v5.py
+    
+    - name: 결과 파일 업로드
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: screener-results-${{ github.run_number }}
+        path: |
+          Peter_Lynch_Report_*.xlsx
+          portfolio_history.json
+          screener_*.log
+        retention-days: 30
+    
+    - name: 히스토리 커밋
+      if: success()
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add portfolio_history.json
+        git diff --staged --quiet || git commit -m "Update portfolio history [skip ci]"
+        git push
