@@ -1,25 +1,16 @@
 """
-피터 린치식 미국 주식 스크리닝 봇 V5 - 최종 완성판
+피터 린치식 미국 주식 스크리닝 봇 V5 - 완전판
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-공격적 포트폴리오 전략:
-- 최고 가치주: 40% (4종목 × 10%)
-- 고성장주: 40% (4종목 × 10%)
-- 균형: 20% (2종목 × 10%)
-총 10종목 = 100%
+모든 기능 포함:
+1. 3중 검증 (Yahoo + 직접계산 + Finviz)
+2. 유형별 순위 관리 (슬롯 시스템)
+3. 한글 기업 설명 (GPT 번역)
+4. 실시간 주가 링크 (Yahoo, Finviz, TradingView)
+5. 상세 에러 로그
+6. 히스토리 추적 (hold_weeks, 관찰 기간)
 
-핵심 수정:
-1. fast_info → info 사용 (안정성 개선)
-2. 소형주 옵션 추가 (Tenbagger 후보 발굴)
-3. 에러 핸들링 강화
-4. 유형별 순위 관리
-
-시가총액 설정:
-- 대형주 중심 (안전): MIN_MARKET_CAP = 1_000_000_000 ($1B)
-- 소형주 발굴 (공격): MIN_MARKET_CAP = 100_000_000 ($100M) ← 피터 린치 추천!
-
-실행: python peter_lynch_screener_v5_complete_fixed.py
-환경 변수: OPENAI_API_KEY (필수), SLACK_BOT_TOKEN, SLACK_CHANNEL_ID (선택)
+환경 변수: OPENAI_API_KEY (필수)
 """
 
 import pandas as pd
@@ -51,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 class GPTAnalyzer:
-    """GPT API 포트폴리오 분석"""
+    """GPT API 포트폴리오 분석 + 한글 번역"""
     
     def __init__(self):
         self.api_key = os.environ.get("OPENAI_API_KEY")
@@ -61,6 +52,8 @@ class GPTAnalyzer:
             'high_growth': {'weight': 0.40, 'stocks': 4},
             'balanced': {'weight': 0.20, 'stocks': 2}
         }
+        
+        self.position_size = 10
         
         if not self.api_key:
             logger.warning("⚠️ OPENAI_API_KEY 미설정 - 기본 분석 모드")
@@ -74,7 +67,29 @@ class GPTAnalyzer:
                 logger.error(f"❌ GPT 초기화 실패: {e}")
                 self.enabled = False
     
+    def translate_to_korean(self, company_name, business_summary):
+        """기업 설명을 한글로 간단히 번역 (30자 이내)"""
+        if not self.enabled or not business_summary:
+            return f"{company_name} 관련 기업"
+        
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "기업 설명을 한글로 30자 이내로 간단히 번역하는 전문가입니다."},
+                    {"role": "user", "content": f"{company_name}: {business_summary[:300]}\n\n위 기업을 한글로 30자 이내로 설명해주세요."}
+                ],
+                max_tokens=100,
+                temperature=0.3
+            )
+            korean_desc = response.choices[0].message.content.strip()
+            return korean_desc[:50]
+        except Exception as e:
+            logger.warning(f"번역 실패 ({company_name}): {e}")
+            return f"{company_name} 관련 기업"
+    
     def analyze_portfolio(self, categorized_stocks, history):
+        """포트폴리오 분석 실행"""
         if not self.enabled:
             return self._basic_analysis(categorized_stocks, history)
         
@@ -84,36 +99,50 @@ class GPTAnalyzer:
             response = self.client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
-                    {"role": "system", "content": "당신은 피터 린치 투자 전략 전문가입니다. 공격적 성장 포트폴리오를 관리합니다."},
+                    {
+                        "role": "system", 
+                        "content": "당신은 피터 린치 투자 전략 전문가입니다. 공격적 성장 포트폴리오를 관리하며, 명확하고 실용적인 투자 조언을 제공합니다."
+                    },
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=4096,
                 temperature=0.3
             )
             
+            analysis = response.choices[0].message.content
             logger.info("✅ GPT 분석 완료")
-            return response.choices[0].message.content
+            return analysis
             
         except Exception as e:
-            logger.error(f"❌ GPT 오류: {e}")
+            logger.error(f"❌ GPT API 오류: {e}")
             return self._basic_analysis(categorized_stocks, history)
     
     def _create_analysis_prompt(self, categorized_stocks, history):
-        stocks_info = "## 이번 주 추천 포트폴리오\n\n"
+        """GPT 프롬프트 생성 - 유형별 순위 기반"""
+        stocks_info = "## 이번 주 추천 포트폴리오 (유형별 Top N)\n\n"
         
         targets = {'best_value': 4, 'high_growth': 4, 'balanced': 2}
         
-        for category, info in [('best_value', '최고가치'), ('high_growth', '고성장'), ('balanced', '균형')]:
+        for category, info in [
+            ('best_value', '최고 가치주'),
+            ('high_growth', '고성장주'),
+            ('balanced', '균형')
+        ]:
             stocks = categorized_stocks.get(category, [])
             target_count = targets[category]
             target_weight = self.portfolio_allocation[category]['weight'] * 100
             
             stocks_info += f"### 📊 {info} (목표: {target_count}종목, {target_weight:.0f}%)\n\n"
+            stocks_info += f"**유형 내 Top {target_count}:**\n"
             
             for i, stock in enumerate(stocks[:target_count * 2], 1):
                 in_target = "✅" if i <= target_count else "⚠️"
                 stocks_info += f"{in_target} **{i}위. {stock['티커']}** - {stock['회사명']}\n"
-                stocks_info += f"   PEG: {stock['PEG']:.2f} | 성장률: {stock['성장률(%)']:.1f}% | 시총: ${stock['시가총액($B)']:.1f}B\n\n"
+                stocks_info += f"   한글: {stock.get('한글설명', 'N/A')}\n"
+                stocks_info += f"   기업: {stock.get('기업설명', 'N/A')[:120]}...\n"
+                stocks_info += f"   PEG: {stock['PEG']:.2f} | 성장률: {stock['성장률(%)']:.1f}% | PE: {stock.get('P/E', 'N/A')}\n"
+                stocks_info += f"   현재가: ${stock['price']:.2f} | 검증: {stock['검증상태']}\n"
+                stocks_info += f"   주가: {stock.get('Yahoo', '')}\n\n"
         
         history_info = self._format_history_info(history, categorized_stocks)
         
@@ -123,72 +152,100 @@ class GPTAnalyzer:
 
 ## 유형별 포트폴리오 전략
 
-**목표**: 최고가치 40% (4종목) + 고성장 40% (4종목) + 균형 20% (2종목)
-**진입**: 1주차 3% → 2주차 3% → 3주차 4% = 10%
+**목표 구성**:
+- 최고 가치주: 4종목 (40%) - 유형 내 4위 이내
+- 고성장주: 4종목 (40%) - 유형 내 4위 이내
+- 균형: 2종목 (20%) - 유형 내 2위 이내
 
-**우선순위**:
-1. 진행 중 종목 (stage < 3) → 무조건 완성
-2. 완성 종목 → 유형 내 목표 순위 유지
-3. 신규 진입 → 유형별 슬롯 여유
+**주차별 진입**: 1주차 3% → 2주차 3% → 3주차 4% = 총 10%
 
-각 종목의 유형, 순위, 매수 이유를 포함하여 이번 주 액션 플랜을 작성해주세요.
+## 우선순위 원칙 (중요!)
+1. **진행 중 종목 (stage < 3)** → 무조건 완성 (유형 순위 무관)
+2. **완성 종목 (stage = 3)** → 유형 내 목표 순위 유지 시 보유
+3. **신규 진입** → 유형별 슬롯 여유 + 부족한 유형 우선
+4. **매도 고려** → 유형 순위 밖 2주 이상
+
+## 요청
+
+각 종목의 유형, 순위, 한글 설명, 매수 이유를 포함하여 이번 주 액션 플랜을 작성해주세요.
 """
         return prompt
     
     def _format_history_info(self, history, categorized_stocks):
+        """히스토리 정보 포맷팅"""
         history_info = "## 현재 보유 포트폴리오\n\n"
         
         if not history:
             return history_info + "보유 없음 (첫 실행)\n"
         
         active = {k: v for k, v in history.items() if v.get('status') == 'ACTIVE'}
+        
         if not active:
             return history_info + "보유 없음\n"
         
-        total = sum(v.get('current_weight_pct', 0) for v in active.values())
+        total_weight = 0
         category_weights = {'best_value': 0, 'high_growth': 0, 'balanced': 0}
         
         for ticker, rec in active.items():
+            weight = rec.get('current_weight_pct', 0)
+            total_weight += weight
             cat = rec.get('category', 'balanced')
             if cat in category_weights:
-                category_weights[cat] += rec.get('current_weight_pct', 0)
+                category_weights[cat] += weight
         
-        history_info += f"**전체 투자**: {total:.1f}%\n"
+        history_info += f"**전체 투자 비중**: {total_weight:.1f}%\n"
         history_info += f"- 최고가치: {category_weights['best_value']:.1f}% (목표: 40%)\n"
         history_info += f"- 고성장: {category_weights['high_growth']:.1f}% (목표: 40%)\n"
         history_info += f"- 균형: {category_weights['balanced']:.1f}% (목표: 20%)\n\n"
         
+        # 모든 추천 종목 수집
         all_stocks = []
         for cat_stocks in categorized_stocks.values():
             all_stocks.extend(cat_stocks)
         
         for ticker, rec in active.items():
             cp = next((s['price'] for s in all_stocks if s['티커'] == ticker), None)
-            pc = ((cp - rec['entry_price']) / rec['entry_price']) * 100 if cp else 0
-            status = "✅ 유지" if cp else "⚠️ 탈락"
+            
+            if cp:
+                pc = ((cp - rec['entry_price']) / rec['entry_price']) * 100
+                status = "✅ 유지"
+            else:
+                pc = 0
+                status = "⚠️ 탈락"
             
             history_info += f"**{ticker}** ({rec.get('stage', 0)}주차, {rec.get('category', 'N/A')})\n"
-            history_info += f"   비중: {rec.get('current_weight_pct', 0):.1f}% | 진입가: ${rec['entry_price']:.2f} | {pc:+.1f}% | {status}\n"
+            history_info += f"   비중: {rec.get('current_weight_pct', 0):.1f}% | 진입: ${rec['entry_price']:.2f} | {pc:+.1f}% | {status}\n"
         
         return history_info
     
     def _basic_analysis(self, categorized_stocks, history):
+        """기본 분석 (GPT 미사용)"""
         result = "🤖 기본 분석 (GPT API 미사용)\n\n"
-        result += "## 공격적 포트폴리오\n\n"
+        result += "## 공격적 포트폴리오 구성\n\n"
+        result += "- 최고가치: 40% (4종목)\n"
+        result += "- 고성장: 40% (4종목)\n"
+        result += "- 균형: 20% (2종목)\n\n"
         
-        for category, name in [('best_value', '최고가치'), ('high_growth', '고성장'), ('balanced', '균형')]:
+        for category, name in [
+            ('best_value', '최고가치'), 
+            ('high_growth', '고성장'), 
+            ('balanced', '균형')
+        ]:
             stocks = categorized_stocks.get(category, [])
             target = self.portfolio_allocation[category]['stocks']
             result += f"**{name}** (목표: {target}종목)\n"
             
             for i, stock in enumerate(stocks[:target], 1):
-                result += f"  {i}. {stock['티커']}: PEG {stock['PEG']:.2f}, 성장률 {stock['성장률(%)']:.1f}%\n"
+                result += f"  {i}. {stock['티커']}: {stock.get('한글설명', stock['회사명'])}\n"
+                result += f"     PEG {stock['PEG']:.2f}, 성장률 {stock['성장률(%)']:.1f}%\n"
             result += "\n"
         
         return result
 
 
 class PortfolioHistoryManager:
+    """포트폴리오 히스토리 관리 - 유형별 순위 기반"""
+    
     def __init__(self, history_file='portfolio_history.json'):
         self.history_file = history_file
         self.history = self.load_history()
@@ -196,9 +253,11 @@ class PortfolioHistoryManager:
         self.STAGE_WEIGHTS = {1: 3, 2: 3, 3: 4}
     
     def load_history(self):
+        """히스토리 로드"""
         if not os.path.exists(self.history_file):
             logger.info("📁 히스토리 파일 없음 - 새로 시작")
             return {}
+        
         try:
             with open(self.history_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -209,6 +268,7 @@ class PortfolioHistoryManager:
             return {}
     
     def save_history(self):
+        """히스토리 저장"""
         try:
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump(self.history, f, indent=4, ensure_ascii=False)
@@ -220,8 +280,15 @@ class PortfolioHistoryManager:
         """유형별 포트폴리오 업데이트 - 유형별 순위 기반 관리"""
         today = datetime.now().strftime("%Y-%m-%d")
         
+        # 현재 활성 종목
         active = {k: v for k, v in self.history.items() if v.get('status') == 'ACTIVE'}
-        category_targets = {'best_value': 4, 'high_growth': 4, 'balanced': 2}
+        
+        # 유형별 목표 종목 수
+        category_targets = {
+            'best_value': 4,
+            'high_growth': 4,
+            'balanced': 2
+        }
         
         # 유형별 Top N 종목 추적
         current_top_by_category = {}
@@ -243,104 +310,184 @@ class PortfolioHistoryManager:
         for ticker, info in list(active.items()):
             stage = info.get('stage', 0)
             category = info.get('category', 'balanced')
-            is_in_category = ticker in current_top_by_category.get(category, {})
+            
+            # 해당 유형의 Top N에 있는지 확인
+            is_in_category_top = ticker in current_top_by_category.get(category, {})
             
             if stage < self.MAX_STAGE:
-                # 진행 중 → 무조건 완성
+                # 아직 미완성 → 무조건 다음 단계 진행 (유형 순위 무관)
                 new_stage = stage + 1
                 self.history[ticker]['stage'] = new_stage
                 self.history[ticker]['last_update'] = today
                 
+                # 비중 업데이트
                 prev_weight = info.get('current_weight_pct', 0)
                 new_weight = prev_weight + self.STAGE_WEIGHTS[new_stage]
                 self.history[ticker]['current_weight_pct'] = new_weight
                 
-                if is_in_category:
+                # 가격 업데이트 (해당 유형 Top에 있으면)
+                if is_in_category_top:
                     rank = current_top_by_category[category][ticker]['rank']
                     self.history[ticker]['current_price'] = current_top_by_category[category][ticker]['price']
                     self.history[ticker]['current_rank'] = rank
-                    logger.info(f"📈 {ticker} ({category}): {stage}→{new_stage}주차 | {prev_weight}%→{new_weight}% | {rank}위")
+                    logger.info(f"📈 {ticker} ({category}): {stage}주차 → {new_stage}주차 | 비중: {prev_weight}% → {new_weight}% | 순위: {rank}위")
                 else:
-                    logger.info(f"📈 {ticker} ({category}): {stage}→{new_stage}주차 | {prev_weight}%→{new_weight}% | ⚠️ 순위 하락")
+                    logger.info(f"📈 {ticker} ({category}): {stage}주차 → {new_stage}주차 | 비중: {prev_weight}% → {new_weight}% | ⚠️ 순위 하락")
             
             else:
-                # 완성 종목
-                if is_in_category:
-                    cat_info = current_top_by_category[category][ticker]
-                    rank = cat_info['rank']
-                    in_target = cat_info['in_target']
+                # 완성 종목 (stage = 3)
+                if is_in_category_top:
+                    # 해당 유형 Top N에 여전히 있음
+                    category_info = current_top_by_category[category][ticker]
+                    rank = category_info['rank']
+                    in_target = category_info['in_target']
                     
                     if in_target:
+                        # 목표 순위 내 (best_value 4위 이내, high_growth 4위 이내, balanced 2위 이내)
                         self.history[ticker]['last_update'] = today
-                        self.history[ticker]['current_price'] = cat_info['price']
+                        self.history[ticker]['current_price'] = category_info['price']
                         self.history[ticker]['current_rank'] = rank
                         self.history[ticker]['hold_weeks'] = info.get('hold_weeks', 0) + 1
-                        logger.info(f"✅ {ticker} ({category}): 완성 유지 | {rank}위 | {info.get('hold_weeks', 0)+1}주")
+                        logger.info(f"✅ {ticker} ({category}): 완성 종목 유지 | {rank}위 | {info.get('hold_weeks', 0) + 1}주차 보유")
                     else:
+                        # 목표 순위 밖 (5위 이하 등)
                         self.history[ticker]['last_update'] = today
+                        self.history[ticker]['current_price'] = category_info['price']
                         self.history[ticker]['current_rank'] = rank
                         self.history[ticker]['hold_weeks'] = info.get('hold_weeks', 0) + 1
                         
                         if info.get('hold_weeks', 0) >= 2:
+                            # 2주 이상 목표 밖 → 매도 고려
                             self.history[ticker]['status'] = 'SOLD'
                             self.history[ticker]['sold_date'] = today
-                            self.history[ticker]['sold_reason'] = f'{category} 목표 밖 ({rank}위, 2주)'
-                            logger.warning(f"📤 {ticker} ({category}): 매도 | {rank}위, {info.get('hold_weeks', 0)}주")
+                            self.history[ticker]['sold_reason'] = f'{category} 목표 순위 밖 ({rank}위, 2주 경과)'
+                            logger.warning(f"📤 {ticker} ({category}): 매도 | {rank}위로 하락, {info.get('hold_weeks', 0)}주 보유")
                         else:
-                            logger.warning(f"⚠️ {ticker} ({category}): 관찰 | {rank}위, {info.get('hold_weeks', 0)+1}주")
+                            logger.warning(f"⚠️ {ticker} ({category}): 관찰 | {rank}위, {info.get('hold_weeks', 0) + 1}주차")
+                
                 else:
-                    # 유형 Top 탈락
+                    # 해당 유형 Top에서 완전 탈락
                     self.history[ticker]['last_update'] = today
                     self.history[ticker]['hold_weeks'] = info.get('hold_weeks', 0) + 1
                     
                     if info.get('hold_weeks', 0) >= 2:
+                        # 2주 이상 탈락 → 매도
                         self.history[ticker]['status'] = 'SOLD'
                         self.history[ticker]['sold_date'] = today
-                        self.history[ticker]['sold_reason'] = f'{category} 탈락 (2주)'
-                        logger.warning(f"📤 {ticker} ({category}): 매도 | 탈락, {info.get('hold_weeks', 0)}주")
+                        self.history[ticker]['sold_reason'] = f'{category} 유형에서 탈락 (2주 경과)'
+                        logger.warning(f"📤 {ticker} ({category}): 매도 | 유형 순위 탈락, {info.get('hold_weeks', 0)}주 보유")
                     else:
-                        logger.warning(f"⚠️ {ticker} ({category}): 관찰 | 탈락, {info.get('hold_weeks', 0)+1}주")
+                        logger.warning(f"⚠️ {ticker} ({category}): 관찰 | 유형 탈락, {info.get('hold_weeks', 0) + 1}주차")
         
-        # 2. 신규 진입
-        total_weight = sum(v.get('current_weight_pct', 0) for v in self.history.values() if v.get('status') == 'ACTIVE')
-        available = 100 - total_weight
+        # 2. 유형별 현황 파악
+        category_status = {}
+        for cat in category_targets.keys():
+            active_in_category = [
+                t for t, info in self.history.items() 
+                if info.get('status') == 'ACTIVE' and info.get('category') == cat
+            ]
+            
+            total_weight = sum(
+                self.history[t].get('current_weight_pct', 0) 
+                for t in active_in_category
+            )
+            
+            completed_count = sum(
+                1 for t in active_in_category 
+                if self.history[t].get('stage', 0) >= self.MAX_STAGE
+            )
+            
+            in_progress_count = sum(
+                1 for t in active_in_category 
+                if self.history[t].get('stage', 0) < self.MAX_STAGE
+            )
+            
+            category_status[cat] = {
+                'target_count': category_targets[cat],
+                'target_weight': category_targets[cat] * 10,
+                'current_count': len(active_in_category),
+                'completed_count': completed_count,
+                'in_progress_count': in_progress_count,
+                'current_weight': total_weight,
+                'need_more': category_targets[cat] - completed_count,
+                'available_slots': category_targets[cat] - len(active_in_category)
+            }
         
-        logger.info(f"\n💰 전체 투자: {total_weight:.1f}% / 100% (여유: {available:.1f}%)")
+        logger.info(f"\n📊 유형별 포트폴리오 현황:")
+        for cat, status in category_status.items():
+            logger.info(f"   [{cat}]")
+            logger.info(f"      목표: {status['target_count']}종목 ({status['target_weight']}%)")
+            logger.info(f"      현재: {status['current_count']}종목 ({status['current_weight']:.1f}%)")
+            logger.info(f"      완성: {status['completed_count']}종목 | 진행중: {status['in_progress_count']}종목")
+            logger.info(f"      필요: {status['need_more']}종목 | 진입가능: {status['available_slots']}슬롯")
         
-        if available >= 3:
+        # 3. 신규 진입 추천
+        total_weight = sum(
+            info.get('current_weight_pct', 0) 
+            for info in self.history.values() 
+            if info.get('status') == 'ACTIVE'
+        )
+        available_weight = 100 - total_weight
+        
+        logger.info(f"\n💰 전체 투자 비중: {total_weight:.1f}% / 100% (여유: {available_weight:.1f}%)")
+        
+        if available_weight >= 3:  # 최소 3% (1주차) 이상 여유
             new_entries = []
             
             for category, stocks in categorized_stocks.items():
-                owned = [t for t, v in self.history.items() if v.get('category') == category and v.get('status') == 'ACTIVE']
-                target = category_targets[category]
+                cat_status = category_status[category]
                 
-                if len(owned) < target:
-                    for i, stock in enumerate(stocks[:target], 1):
+                # 해당 유형에 진입 가능한 슬롯이 있는지
+                if cat_status['available_slots'] > 0:
+                    target_count = category_targets[category]
+                    
+                    # 이미 보유 중인 티커
+                    owned_tickers = [
+                        t for t, info in self.history.items()
+                        if info.get('category') == category and info.get('status') == 'ACTIVE'
+                    ]
+                    
+                    # 해당 유형 Top N 중에서 미보유 종목 찾기
+                    for stock in stocks[:target_count * 2]:  # 여유있게 2배수 체크
                         ticker = stock['티커'].upper()
-                        if ticker not in owned and (ticker not in self.history or self.history[ticker].get('status') != 'ACTIVE'):
-                            new_entries.append({
-                                'ticker': ticker,
-                                'category': category,
-                                'rank': i,
-                                'price': stock['price'],
-                                'peg': stock['PEG'],
-                                'growth': stock['성장률(%)'],
-                                'priority': (target - len(owned)) * 100 + (10 - i)
-                            })
+                        
+                        if ticker not in owned_tickers:
+                            # 신규 또는 이전에 매도한 종목
+                            if ticker not in self.history or self.history[ticker].get('status') in ['REMOVED', 'SOLD']:
+                                rank = list(current_top_by_category[category].keys()).index(ticker) + 1 if ticker in current_top_by_category[category] else 999
+                                
+                                new_entries.append({
+                                    'ticker': ticker,
+                                    'category': category,
+                                    'rank': rank,
+                                    'peg': stock['PEG'],
+                                    'growth': stock['성장률(%)'],
+                                    'price': stock['price'],
+                                    'priority_score': cat_status['need_more'] * 100 + (10 - rank)  # 부족한 유형 + 순위 높은 종목 우선
+                                })
             
-            new_entries.sort(key=lambda x: -x['priority'])
-            max_new = int(available / 3)
+            # 우선순위 순으로 정렬
+            new_entries.sort(key=lambda x: -x['priority_score'])
             
-            logger.info(f"\n🎯 신규 진입 가능: 최대 {max_new}종목")
+            # 진입 가능한 만큼만 추가
+            max_new_entries = min(
+                int(available_weight / 3),  # 최소 1주차(3%) 기준
+                sum(cat_status['available_slots'] for cat_status in category_status.values())
+            )
             
-            for entry in new_entries[:max_new]:
-                self.history[entry['ticker']] = {
-                    'ticker': entry['ticker'],
-                    'category': entry['category'],
+            logger.info(f"\n🎯 신규 진입 가능: 최대 {max_new_entries}종목\n")
+            
+            for entry in new_entries[:max_new_entries]:
+                ticker = entry['ticker']
+                category = entry['category']
+                
+                self.history[ticker] = {
+                    'ticker': ticker,
+                    'category': category,
                     'entry_date': today,
                     'entry_price': entry['price'],
-                    'stage': 1,
-                    'current_weight_pct': 3,
+                    'stage': 1,  # 1주차 시작
+                    'current_weight_pct': self.STAGE_WEIGHTS[1],  # 3%
                     'status': 'ACTIVE',
                     'last_update': today,
                     'current_price': entry['price'],
@@ -348,14 +495,18 @@ class PortfolioHistoryManager:
                     'peg_at_entry': entry['peg'],
                     'growth_at_entry': entry['growth']
                 }
-                logger.info(f"🟢 {entry['ticker']}: 신규 진입 ({entry['category']}, {entry['rank']}위, 3%)")
+                
+                logger.info(f"🟢 {ticker}: 신규 진입 ({category}, {entry['rank']}위, 1주차 3%)")
+        
         else:
-            logger.info(f"\n⚠️ 신규 진입 불가: 여유 {available:.1f}%")
+            logger.info(f"\n⚠️ 신규 진입 불가: 여유 비중 부족 ({available_weight:.1f}%)")
         
         self.save_history()
 
 
 class SlackSender:
+    """슬랙 메시지 전송"""
+    
     def __init__(self):
         self.token = os.environ.get('SLACK_BOT_TOKEN')
         self.channel_id = os.environ.get('SLACK_CHANNEL_ID')
@@ -364,11 +515,17 @@ class SlackSender:
         if self.enabled:
             try:
                 from slack_sdk import WebClient
+                from slack_sdk.errors import SlackApiError
                 self.client = WebClient(token=self.token)
+                self.SlackApiError = SlackApiError
+                
                 response = self.client.auth_test()
                 logger.info(f"✅ 슬랙 연동: {response['team']}")
-            except:
+            except ImportError:
                 logger.warning("⚠️ slack_sdk 미설치")
+                self.enabled = False
+            except Exception as e:
+                logger.error(f"❌ 슬랙 초기화 실패: {e}")
                 self.enabled = False
         else:
             logger.info("ℹ️ 슬랙 미설정 - 콘솔 출력")
@@ -376,26 +533,39 @@ class SlackSender:
     def send_message(self, message):
         if not self.enabled:
             return False
+        
         try:
-            self.client.chat_postMessage(channel=self.channel_id, text=message, mrkdwn=True)
+            self.client.chat_postMessage(
+                channel=self.channel_id,
+                text=message,
+                mrkdwn=True
+            )
             logger.info("✅ 슬랙 메시지 전송")
             return True
         except Exception as e:
-            logger.error(f"❌ 슬랙 실패: {e}")
+            logger.error(f"❌ 슬랙 전송 실패: {e}")
             return False
     
     def send_file(self, file_path, title=None):
         if not self.enabled:
             return False
+        
         try:
-            self.client.files_upload_v2(channel=self.channel_id, file=file_path, title=title)
-            logger.info("✅ 슬랙 파일 전송")
+            self.client.files_upload_v2(
+                channel=self.channel_id,
+                file=file_path,
+                title=title or os.path.basename(file_path)
+            )
+            logger.info(f"✅ 슬랙 파일 전송: {file_path}")
             return True
-        except:
+        except Exception as e:
+            logger.error(f"❌ 슬랙 파일 실패: {e}")
             return False
 
 
 class PeterLynchScreener:
+    """피터 린치 스크리너 메인 클래스"""
+    
     def __init__(self):
         self.tickers = []
         self.filtered = []
@@ -407,22 +577,40 @@ class PeterLynchScreener:
         self.slack_sender = SlackSender()
         
         # 시가총액 설정
-        # 안전 (대형주): 1_000_000_000 ($1B)
-        # 공격 (소형주 Tenbagger): 100_000_000 ($100M) ← 피터 린치 추천!
-        self.MIN_MARKET_CAP = 100_000_000  # ← 여기 수정!
+        self.MIN_MARKET_CAP = 1_000_000_000  # $1B (소형주: 100_000_000)
         
-        self.GROWTH_LIMITS = {'min': 15, 'ideal_min': 20, 'ideal_max': 50, 'max': 200}
-        self.PEG_LIMITS = {'excellent': 0.5, 'good': 0.7, 'fair': 1.0, 'max': 1.5}
+        # 필터 기준
+        self.GROWTH_LIMITS = {
+            'min': 15,
+            'ideal_min': 20,
+            'ideal_max': 50,
+            'max': 200
+        }
         
-        self.headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'}
+        self.PEG_LIMITS = {
+            'excellent': 0.5,
+            'good': 0.7,
+            'fair': 1.0,
+            'max': 1.5
+        }
+        
+        self.TOLERANCE = 0.20  # 3중 검증 허용 오차 20%
+        
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+        }
+        
+        # 에러 추적
+        self.error_details = []
     
     def run(self, ticker_limit=1000):
+        """메인 실행 함수"""
         start = time.time()
         
-        logger.info("="*80)
-        logger.info("🎯 피터 린치 스크리너 V5 - 공격적 포트폴리오")
+        logger.info("=" * 80)
+        logger.info("🎯 피터 린치 스크리너 V5 - 완전판")
         logger.info(f"💰 최소 시가총액: ${self.MIN_MARKET_CAP/1e9:.1f}B")
-        logger.info("="*80)
+        logger.info("=" * 80)
         
         if not self._step1_collect_tickers(ticker_limit):
             return None
@@ -438,41 +626,58 @@ class PeterLynchScreener:
         self._step7_send_to_slack(filename, gpt_advice)
         self._print_summary()
         
-        logger.info(f"\n⏱️ 소요: {(time.time()-start)/60:.1f}분")
-        logger.info(f"📊 파일: {filename}\n")
+        elapsed = (time.time() - start) / 60
+        logger.info(f"\n⏱️ 총 소요 시간: {elapsed:.1f}분")
+        logger.info(f"📊 결과 파일: {filename}\n")
+        
         return filename
     
     def _step1_collect_tickers(self, limit):
-        logger.info("\n[1/7] 티커 수집...")
+        """Step 1: NASDAQ API에서 티커 수집"""
+        logger.info("\n[Step 1/7] 티커 수집 중...")
+        
         try:
             url = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=25000&download=true"
-            data = requests.get(url, headers=self.headers, timeout=30).json()
+            response = requests.get(url, headers=self.headers, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'data' not in data or 'rows' not in data['data']:
+                logger.error("❌ API 응답 형식 오류")
+                return False
+            
             df = pd.DataFrame(data['data']['rows'])
+            
+            # 필터링
             df = df[df['symbol'].notna()].copy()
             df['symbol'] = df['symbol'].str.strip().str.upper()
             df = df[~df['symbol'].str.contains(r'\^|\.|-', regex=True, na=False)]
+            
             if 'name' in df.columns:
                 df = df[~df['name'].str.contains('ETF|ETN|FUND|TRUST', case=False, na=False)]
+            
             df = df[df['symbol'].str.len().between(1, 5)]
             df = df[df['symbol'].str.isalpha()]
             df = df.drop_duplicates(subset=['symbol'])
+            
             self.tickers = df['symbol'].tolist()[:limit]
-            logger.info(f"✅ {len(self.tickers)}개 수집\n")
+            logger.info(f"✅ {len(self.tickers)}개 티커 수집 완료\n")
             return True
+            
         except Exception as e:
             logger.error(f"❌ 티커 수집 실패: {e}")
             return False
     
     def _step2_basic_filter(self):
-        """Step 2: 기본 필터 (info 사용 - fast_info 문제 해결)"""
-        logger.info("[2/7] 기본 필터...")
+        """Step 2: 기본 필터 (info 사용)"""
+        logger.info("[Step 2/7] 기본 필터링 중...")
         passed = []
         errors = 0
         
         for i, ticker in enumerate(self.tickers, 1):
             try:
                 stock = yf.Ticker(ticker)
-                info = stock.info  # fast_info 대신 info 사용
+                info = stock.info
                 
                 # 가격과 시총 가져오기 (여러 필드 시도)
                 price = (info.get('currentPrice') or 
@@ -483,9 +688,11 @@ class PeterLynchScreener:
                 
                 if not price or not mcap:
                     errors += 1
+                    if errors <= 5:
+                        self.error_details.append(f"{ticker}: 데이터 없음")
                     continue
                 
-                # 기본 필터
+                # 기본 필터: 가격 $1 이상, 시총 MIN_MARKET_CAP 이상
                 if price >= 1.0 and mcap > self.MIN_MARKET_CAP:
                     passed.append({
                         'ticker': ticker,
@@ -496,31 +703,43 @@ class PeterLynchScreener:
                 if i % 100 == 0:
                     logger.info(f"  {i}/{len(self.tickers)} - 통과: {len(passed)}개, 에러: {errors}개")
                 
-                time.sleep(0.1)  # info는 느리므로 0.1초 대기
+                time.sleep(0.1)
                 
             except Exception as e:
                 errors += 1
-                if errors % 50 == 0:
-                    logger.warning(f"  에러 누적: {errors}개")
+                if errors <= 5:
+                    self.error_details.append(f"{ticker}: {str(e)[:50]}")
                 continue
         
         self.filtered = passed
-        logger.info(f"✅ {len(self.filtered)}개 필터 통과 (에러: {errors}개)\n")
+        logger.info(f"✅ {len(self.filtered)}개 필터 통과 (에러: {errors}개)")
+        
+        # 에러 상세 출력
+        if self.error_details:
+            logger.info(f"\n🔍 에러 상세 (처음 5개):")
+            for detail in self.error_details[:5]:
+                logger.info(f"   {detail}")
+        
+        logger.info("")
         return len(self.filtered) > 0
     
     def _step3_deep_analysis(self):
-        logger.info("[3/7] 심층 분석...")
+        """Step 3: 심층 분석 (3중 검증)"""
+        logger.info("[Step 3/7] 심층 분석 중 (3중 검증)...")
         validated = []
         errors = 0
         
         for i, stock_data in enumerate(self.filtered, 1):
             try:
-                result = self._analyze_stock(stock_data)
+                result = self._analyze_with_triple_validation(stock_data)
+                
                 if result and result['is_valid']:
                     validated.append(result)
+                    if '3중 검증' in result['validation_status']:
+                        logger.info(f"  ✅ {stock_data['ticker']}: 3중 검증 통과")
                 
                 if i % 25 == 0:
-                    logger.info(f"  {i}/{len(self.filtered)} - 검증: {len(validated)}개")
+                    logger.info(f"  {i}/{len(self.filtered)} - 검증 완료: {len(validated)}개")
                 
                 time.sleep(0.3)
                 
@@ -529,138 +748,336 @@ class PeterLynchScreener:
                 continue
         
         self.validated = validated
-        logger.info(f"✅ {len(self.validated)}개 검증 완료\n")
+        logger.info(f"✅ {len(self.validated)}개 종목 검증 완료\n")
         return len(self.validated) > 0
     
-    def _analyze_stock(self, basic_data):
+    def _analyze_with_triple_validation(self, basic_data):
+        """3중 검증: Yahoo + 직접계산 + Finviz"""
         ticker = basic_data['ticker']
         stock = yf.Ticker(ticker)
         info = stock.info
         
+        # 기본 정보
+        name = info.get('longName', 'N/A')
+        sector = info.get('sector', 'N/A')
+        industry = info.get('industry', 'N/A')
+        business = info.get('longBusinessSummary', '')[:500]
+        price = basic_data['price']
+        market_cap = basic_data['market_cap']
+        
+        # 1. Yahoo API 데이터
         yahoo_pe = info.get('trailingPE') or info.get('forwardPE')
         yahoo_growth = info.get('earningsGrowth')
         
         if not yahoo_pe or not yahoo_growth:
             return None
         
-        growth_pct = yahoo_growth * 100
-        if growth_pct <= 0:
+        yahoo_growth_pct = yahoo_growth * 100
+        if yahoo_growth_pct <= 0:
             return None
         
-        peg = yahoo_pe / growth_pct
+        yahoo_peg = yahoo_pe / yahoo_growth_pct
         
-        if peg >= self.PEG_LIMITS['max'] or growth_pct < self.GROWTH_LIMITS['min']:
+        # 2. 직접 계산
+        calculated_peg = self._calculate_peg_manually(stock, yahoo_pe)
+        
+        # 3. Finviz 크롤링
+        finviz_peg = self._get_finviz_peg(ticker)
+        
+        # 3중 검증
+        validation_result = self._triple_validate(yahoo_peg, calculated_peg, finviz_peg)
+        
+        if not validation_result['valid']:
+            return None
+        
+        final_peg = validation_result['peg']
+        
+        # PEG 필터
+        if final_peg >= self.PEG_LIMITS['max']:
+            return None
+        
+        # 성장률 필터
+        if yahoo_growth_pct < self.GROWTH_LIMITS['min']:
+            return None
+        
+        # 부채 체크
+        debt_to_equity = info.get('debtToEquity')
+        if sector != 'Financial Services' and debt_to_equity and debt_to_equity > 200:
             return None
         
         return {
             'ticker': ticker,
-            'name': info.get('longName', 'N/A'),
-            'sector': info.get('sector', 'N/A'),
-            'industry': info.get('industry', 'N/A'),
-            'business_summary': info.get('longBusinessSummary', '')[:500],
-            'price': basic_data['price'],
-            'market_cap': basic_data['market_cap'],
+            'name': name,
+            'sector': sector,
+            'industry': industry,
+            'business_summary': business,
+            'price': price,
+            'market_cap': market_cap,
             'pe_ratio': yahoo_pe,
-            'peg': peg,
-            'growth_rate': growth_pct,
-            'validation_status': '✅ 검증',
+            'peg': final_peg,
+            'growth_rate': yahoo_growth_pct,
+            'debt_to_equity': debt_to_equity,
+            'validation_status': validation_result['status'],
+            'data_sources': validation_result['sources'],
             'is_valid': True
         }
     
+    def _calculate_peg_manually(self, stock, pe_ratio):
+        """직접 계산: PEG = PE / 성장률"""
+        try:
+            financials = stock.financials
+            
+            if financials is None or financials.empty:
+                return None
+            
+            # Net Income 찾기
+            net_income_row = None
+            for row_name in ['Net Income', 'Net Income Common Stockholders']:
+                if row_name in financials.index:
+                    net_income_row = row_name
+                    break
+            
+            if not net_income_row:
+                return None
+            
+            net_income = financials.loc[net_income_row]
+            
+            # 최근 2년 데이터
+            if len(net_income) < 2:
+                return None
+            
+            recent = net_income.iloc[0]
+            previous = net_income.iloc[1]
+            
+            if previous <= 0:
+                return None
+            
+            # 성장률 계산
+            growth_rate = ((recent - previous) / abs(previous)) * 100
+            
+            if growth_rate <= 0:
+                return None
+            
+            # PEG 계산
+            calculated_peg = pe_ratio / growth_rate
+            
+            return calculated_peg
+            
+        except:
+            return None
+    
+    def _get_finviz_peg(self, ticker):
+        """Finviz에서 PEG 크롤링"""
+        try:
+            url = f"https://finviz.com/quote.ashx?t={ticker}"
+            response = requests.get(url, headers=self.headers, timeout=10)
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Finviz 테이블에서 PEG 찾기
+            rows = soup.find_all('tr')
+            for row in rows:
+                cells = row.find_all('td')
+                for i, cell in enumerate(cells):
+                    if cell.text.strip() == 'PEG':
+                        if i + 1 < len(cells):
+                            peg_text = cells[i + 1].text.strip()
+                            if peg_text and peg_text != '-':
+                                return float(peg_text)
+            
+            return None
+            
+        except:
+            return None
+    
+    def _triple_validate(self, yahoo_peg, calculated_peg, finviz_peg):
+        """3중 검증 로직"""
+        sources = []
+        valid_pegs = []
+        
+        if yahoo_peg and 0 < yahoo_peg < 10:
+            sources.append('Yahoo')
+            valid_pegs.append(yahoo_peg)
+        
+        if calculated_peg and 0 < calculated_peg < 10:
+            sources.append('Calc')
+            valid_pegs.append(calculated_peg)
+        
+        if finviz_peg and 0 < finviz_peg < 10:
+            sources.append('Finviz')
+            valid_pegs.append(finviz_peg)
+        
+        # 최소 2개 이상 필요
+        if len(valid_pegs) < 2:
+            return {'valid': False}
+        
+        # 평균값
+        avg_peg = sum(valid_pegs) / len(valid_pegs)
+        
+        # 오차 확인 (20% 이내)
+        for peg in valid_pegs:
+            if abs(peg - avg_peg) / avg_peg > self.TOLERANCE:
+                # 하나라도 오차 크면 중간값 사용
+                valid_pegs_sorted = sorted(valid_pegs)
+                median_peg = valid_pegs_sorted[len(valid_pegs_sorted) // 2]
+                
+                return {
+                    'valid': True,
+                    'peg': round(median_peg, 2),
+                    'status': '✅ 부분 검증 (중간값)',
+                    'sources': sources
+                }
+        
+        # 모두 오차 범위 내
+        return {
+            'valid': True,
+            'peg': round(avg_peg, 2),
+            'status': f'✅ {len(sources)}중 검증 통과',
+            'sources': sources
+        }
+    
     def _step4_categorize(self):
-        logger.info("[4/7] 유형별 분류...")
+        """Step 4: 유형별 분류 + 한글 번역"""
+        logger.info("[Step 4/7] 유형별 분류 + 한글 번역...")
         df = pd.DataFrame(self.validated)
         
-        categorized = {'best_value': [], 'high_growth': [], 'balanced': []}
+        categorized = {
+            'best_value': [],
+            'high_growth': [],
+            'balanced': []
+        }
         
-        # 최고 가치주
+        # 최고 가치주 (PEG < 0.7, 성장률 20-50%)
         best = df[
-            (df['peg'] < 0.7) &
-            (df['growth_rate'] >= 20) &
-            (df['growth_rate'] <= 50) &
-            (df['market_cap'] > 5e9)
+            (df['peg'] < self.PEG_LIMITS['good']) &
+            (df['growth_rate'] >= self.GROWTH_LIMITS['ideal_min']) &
+            (df['growth_rate'] <= self.GROWTH_LIMITS['ideal_max']) &
+            (df['market_cap'] > 5_000_000_000)
         ].sort_values('peg').head(10)
         
         for _, row in best.iterrows():
-            categorized['best_value'].append(self._create_rec(row, 'best_value'))
+            categorized['best_value'].append(self._create_recommendation(row, 'best_value'))
         
-        # 고성장주
+        # 고성장주 (성장률 50%+, PEG < 1.2)
         high = df[
             (df['growth_rate'] > 50) &
-            (df['growth_rate'] <= 200) &
+            (df['growth_rate'] <= self.GROWTH_LIMITS['max']) &
             (df['peg'] < 1.2) &
-            (df['market_cap'] > 3e9)
+            (df['market_cap'] > 3_000_000_000)
         ].sort_values('growth_rate', ascending=False).head(10)
         
         for _, row in high.iterrows():
-            categorized['high_growth'].append(self._create_rec(row, 'high_growth'))
+            categorized['high_growth'].append(self._create_recommendation(row, 'high_growth'))
         
-        # 균형
-        bal = df[
+        # 균형 (PEG < 1.0, 성장률 20-40%)
+        balanced = df[
             (df['peg'] < 1.0) &
             (df['growth_rate'] >= 20) &
             (df['growth_rate'] <= 40) &
-            (df['market_cap'] > 10e9)
+            (df['market_cap'] > 10_000_000_000)
         ].sort_values('peg').head(5)
         
-        for _, row in bal.iterrows():
-            categorized['balanced'].append(self._create_rec(row, 'balanced'))
+        for _, row in balanced.iterrows():
+            categorized['balanced'].append(self._create_recommendation(row, 'balanced'))
         
         self.categorized_stocks = categorized
         
         logger.info(f"✅ 최고 가치주: {len(categorized['best_value'])}개")
         logger.info(f"✅ 고성장주: {len(categorized['high_growth'])}개")
         logger.info(f"✅ 균형: {len(categorized['balanced'])}개\n")
+        
         return True
     
-    def _create_rec(self, row, cat):
+    def _create_recommendation(self, row, category):
+        """추천 생성 + 한글 번역"""
+        ticker = row['ticker']
+        peg = row['peg']
+        growth = row['growth_rate']
+        market_cap_b = row['market_cap'] / 1e9
+        
+        category_names = {
+            'best_value': '최고 가치주',
+            'high_growth': '고성장주',
+            'balanced': '균형'
+        }
+        
+        opinion = "🟢 강력 매수" if peg < self.PEG_LIMITS['excellent'] else ("🟢 매수" if peg < self.PEG_LIMITS['good'] else "🟡 관심")
+        
+        # 한글 번역
+        korean_desc = self.gpt_analyzer.translate_to_korean(
+            row.get('name', 'N/A'),
+            row.get('business_summary', '')
+        )
+        
         return {
-            '티커': row['ticker'],
+            '티커': ticker,
             '회사명': row.get('name', 'N/A'),
+            '한글설명': korean_desc,
             '섹터': row.get('sector', 'N/A'),
             '산업': row.get('industry', 'N/A'),
             '기업설명': row.get('business_summary', 'N/A'),
-            'PEG': row['peg'],
-            '성장률(%)': row['growth_rate'],
+            'PEG': peg,
+            '성장률(%)': growth,
             'P/E': row.get('pe_ratio'),
-            '시가총액($B)': round(row['market_cap'] / 1e9, 2),
-            '투자의견': "🟢 강력매수" if row['peg'] < 0.5 else "🟢 매수",
+            '시가총액($B)': round(market_cap_b, 1),
+            '투자의견': opinion,
             '검증상태': row['validation_status'],
+            '데이터출처': ', '.join(row['data_sources']),
+            '유형': category_names[category],
+            'Yahoo': f"https://finance.yahoo.com/quote/{ticker}",
+            'Finviz': f"https://finviz.com/quote.ashx?t={ticker}",
+            'TradingView': f"https://www.tradingview.com/symbols/{ticker}",
             'price': row['price'],
-            'category': cat
+            'category': category
         }
     
     def _step5_create_excel(self):
-        logger.info("[5/7] Excel 생성...")
+        """Step 5: Excel 리포트 생성"""
+        logger.info("[Step 5/7] Excel 리포트 생성 중...")
+        
         today = datetime.now().strftime('%Y%m%d')
         filename = f'Peter_Lynch_Report_{today}.xlsx'
         
         wb = Workbook()
         wb.remove(wb.active)
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
         
-        for name, key in [('🏆 최고가치 (40%)', 'best_value'), ('🚀 고성장 (40%)', 'high_growth'), ('⚖️ 균형 (20%)', 'balanced')]:
+        for sheet_name, key in [
+            ('🏆 최고 가치주 (40%)', 'best_value'),
+            ('🚀 고성장주 (40%)', 'high_growth'),
+            ('⚖️ 균형 (20%)', 'balanced')
+        ]:
             stocks = self.categorized_stocks[key]
             if not stocks:
                 continue
             
-            ws = wb.create_sheet(title=name)
-            cols = ['티커', '회사명', '섹터', '산업', '기업설명', 'PEG', '성장률(%)', 'P/E', '시가총액($B)', '투자의견', '검증상태']
+            ws = wb.create_sheet(title=sheet_name)
+            columns = ['티커', '회사명', '한글설명', '유형', '섹터', '산업', 'PEG', '성장률(%)', 'P/E',
+                      '시가총액($B)', '투자의견', '검증상태', '데이터출처', 'Yahoo', 'Finviz', 'TradingView']
             
-            for i, col in enumerate(cols, 1):
-                cell = ws.cell(row=1, column=i, value=col)
-                cell.font = Font(bold=True, color="FFFFFF")
-                cell.fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-                cell.alignment = Alignment(horizontal='center', vertical='center')
+            for col_idx, col_name in enumerate(columns, 1):
+                cell = ws.cell(row=1, column=col_idx, value=col_name)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
             
-            for i, stock in enumerate(stocks, 2):
-                for j, col in enumerate(cols, 1):
-                    cell = ws.cell(row=i, column=j, value=stock.get(col, ''))
+            for row_idx, stock in enumerate(stocks, 2):
+                for col_idx, col_name in enumerate(columns, 1):
+                    value = stock.get(col_name, '')
+                    cell = ws.cell(row=row_idx, column=col_idx, value=value)
                     cell.alignment = Alignment(wrap_text=True, vertical='top')
-                    if col == '투자의견' and '강력' in str(stock.get(col, '')):
+                    
+                    # 하이퍼링크 추가
+                    if col_name in ['Yahoo', 'Finviz', 'TradingView'] and value:
+                        cell.hyperlink = value
+                        cell.style = 'Hyperlink'
+                        cell.font = Font(color="0563C1", underline="single")
+                    
+                    if col_name == '투자의견' and '강력 매수' in str(value):
                         cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
                         cell.font = Font(bold=True, color="006100")
             
-            widths = [8, 25, 15, 20, 50, 8, 10, 8, 12, 15, 15]
+            widths = [8, 25, 35, 12, 15, 20, 8, 10, 8, 12, 15, 15, 20, 15, 15, 15]
             for i, width in enumerate(widths, 1):
                 ws.column_dimensions[get_column_letter(i)].width = width
         
@@ -669,40 +1086,61 @@ class PeterLynchScreener:
         return filename
     
     def _step6_gpt_analysis(self):
-        logger.info("[6/7] GPT 분석...")
-        advice = self.gpt_analyzer.analyze_portfolio(self.categorized_stocks, self.history_manager.history)
+        """Step 6: GPT 분석"""
+        logger.info("[Step 6/7] GPT 포트폴리오 분석...")
+        
+        gpt_advice = self.gpt_analyzer.analyze_portfolio(
+            self.categorized_stocks,
+            self.history_manager.history
+        )
+        
         self.history_manager.update_from_portfolio(self.categorized_stocks)
+        
         logger.info("✅ 완료\n")
-        return advice
+        return gpt_advice
     
-    def _step7_send_to_slack(self, filename, advice):
-        logger.info("[7/7] 결과 전송...")
+    def _step7_send_to_slack(self, filename, gpt_advice):
+        """Step 7: 슬랙 전송"""
+        logger.info("[Step 7/7] 결과 전송...")
+        
         if not self.slack_sender.enabled:
             print("\n" + "="*80)
             print("📊 GPT 분석 결과")
             print("="*80)
-            print(advice)
+            print(gpt_advice)
             print("="*80 + "\n")
             return
         
         today = datetime.now().strftime('%Y년 %m월 %d일')
-        msg = f"🤖 *피터 린치 봇*\n📅 {today}\n\n{advice}"
-        self.slack_sender.send_message(msg)
+        week_num = datetime.now().isocalendar()[1]
+        
+        message = f"""🤖 *피터 린치 봇 - 공격적 포트폴리오*
+📅 {today} ({week_num}주차)
+
+{gpt_advice}
+
+━━━━━━━━━━━━━━━━━━
+📂 {filename}
+━━━━━━━━━━━━━━━━━━"""
+        
+        self.slack_sender.send_message(message)
         self.slack_sender.send_file(filename, f"리포트 - {today}")
         logger.info("✅ 완료\n")
     
     def _print_summary(self):
+        """콘솔 요약"""
         print("\n" + "="*80)
         print("💡 공격적 포트폴리오 추천")
         print("="*80)
         
-        for cat, name in [('best_value', '최고가치'), ('high_growth', '고성장'), ('balanced', '균형')]:
-            stocks = self.categorized_stocks[cat]
+        for category, name in [('best_value', '최고 가치주'), ('high_growth', '고성장주'), ('balanced', '균형')]:
+            stocks = self.categorized_stocks[category]
             if stocks:
                 print(f"\n【{name}】")
-                for s in stocks[:3]:
-                    print(f"  {s['티커']:6} - {s['회사명']}")
-                    print(f"     PEG: {s['PEG']:.2f} | 성장률: {s['성장률(%)']:.1f}% | 시총: ${s['시가총액($B)']:.2f}B")
+                for stock in stocks[:3]:
+                    print(f"  {stock['티커']:6} - {stock.get('한글설명', stock['회사명'])}")
+                    print(f"     PEG: {stock['PEG']:.2f} | 성장률: {stock['성장률(%)']:.1f}% | {stock['검증상태']}")
+                    print(f"     주가: {stock['Yahoo']}")
         
         print("\n" + "="*80)
 
@@ -710,41 +1148,36 @@ class PeterLynchScreener:
 def main():
     print("""
 ╔════════════════════════════════════════════════════════════════╗
-║  피터 린치 주식 스크리너 V5 - 최종 완성판                    ║
+║  피터 린치 주식 스크리너 V5 - 완전판                         ║
 ║                                                                ║
-║  🎯 공격적 포트폴리오 전략:                                   ║
-║     최고 가치주: 40% (4종목)                                  ║
-║     고성장주: 40% (4종목)                                     ║
-║     균형: 20% (2종목)                                         ║
-║                                                                ║
-║  ⚡ 핵심 기능:                                                 ║
-║     - info 사용 (안정성)                                      ║
-║     - 유형별 순위 관리                                        ║
-║     - GPT-4o 분석                                             ║
-║     - 소형주 옵션 (Tenbagger 후보)                           ║
-║                                                                ║
-║  💰 시가총액 설정:                                            ║
-║     안전 (대형주): $1B                                        ║
-║     공격 (소형주): $100M ← 코드에서 수정 가능                ║
+║  ✅ 3중 검증 (Yahoo + 직접계산 + Finviz)                     ║
+║  ✅ 유형별 순위 관리 (슬롯 시스템)                           ║
+║  ✅ 한글 기업 설명 (GPT 번역)                                ║
+║  ✅ 실시간 주가 링크 (Yahoo, Finviz, TradingView)            ║
+║  ✅ 상세 에러 로그                                            ║
 ║                                                                ║
 ║  환경 변수: OPENAI_API_KEY (필수)                             ║
 ╚════════════════════════════════════════════════════════════════╝
     """)
     
     if not os.environ.get("OPENAI_API_KEY"):
-        print("⚠️  경고: OPENAI_API_KEY 미설정")
+        print("⚠️  경고: OPENAI_API_KEY가 설정되지 않았습니다.")
+        print("   기본 분석 모드로 실행됩니다.\n")
     
     if not os.environ.get("SLACK_BOT_TOKEN"):
-        print("ℹ️  정보: 슬랙 미설정\n")
+        print("ℹ️  정보: 슬랙이 설정되지 않았습니다.")
+        print("   결과는 콘솔에 출력됩니다.\n")
     
     screener = PeterLynchScreener()
     result = screener.run(ticker_limit=1000)
     
     if result:
-        print(f"\n✅ 완료: {result}")
+        print(f"\n✅ 스크리닝 완료!")
+        print(f"📊 Excel 파일: {result}")
         print(f"📁 히스토리: portfolio_history.json")
     else:
-        print("\n❌ 실패")
+        print("\n❌ 스크리닝 실패")
+        print("로그 파일을 확인하세요.")
 
 
 if __name__ == "__main__":
