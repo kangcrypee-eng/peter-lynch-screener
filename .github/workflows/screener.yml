@@ -48,7 +48,7 @@ jobs:
         SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
       run: |
         echo "🎯 피터 린치 스크리너 시작..."
-        python peter_lynch_screener_v5_complete_fixed.py || echo "⚠️ 스크리너 실행 중 경고 발생"
+        python peter_lynch_screener_v5.py || echo "⚠️ 스크리너 실행 중 경고 발생"
     
     - name: 결과 파일 업로드
       uses: actions/upload-artifact@v4
