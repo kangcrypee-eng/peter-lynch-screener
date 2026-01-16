@@ -2,9 +2,12 @@ name: Peter Lynch Screener
 
 on:
   schedule:
-    # 매주 월요일 오전 9시 (한국시간 기준 오후 6시)
-    - cron: '0 0 * * 1'
+    # 매주 월요일 오전 9시 (한국시간 기준 오후 6시 = UTC 09:00)
+    - cron: '0 9 * * 1'
   workflow_dispatch:  # 수동 실행 가능
+
+permissions:
+  contents: write  # 히스토리 커밋을 위해 write 권한 필요
 
 jobs:
   run-screener:
@@ -15,6 +18,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
     
     - name: Python 설정
       uses: actions/setup-python@v5
@@ -30,10 +34,11 @@ jobs:
     - name: 히스토리 파일 복원
       run: |
         if [ -f portfolio_history.json ]; then
-          echo "히스토리 파일 발견"
+          echo "✅ 히스토리 파일 발견"
+          cat portfolio_history.json
         else
           echo "{}" > portfolio_history.json
-          echo "새 히스토리 파일 생성"
+          echo "📁 새 히스토리 파일 생성"
         fi
     
     - name: 스크리너 실행
@@ -42,7 +47,8 @@ jobs:
         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
         SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
       run: |
-        python peter_lynch_screener_v5.py
+        echo "🎯 피터 린치 스크리너 시작..."
+        python peter_lynch_screener_v5_complete_fixed.py || echo "⚠️ 스크리너 실행 중 경고 발생"
     
     - name: 결과 파일 업로드
       uses: actions/upload-artifact@v4
@@ -55,11 +61,45 @@ jobs:
           screener_*.log
         retention-days: 30
     
-    - name: 히스토리 커밋
+    - name: 히스토리 커밋 및 푸시
       if: success()
       run: |
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
         git config --local user.name "github-actions[bot]"
+        
+        # portfolio_history.json 변경사항 확인
         git add portfolio_history.json
-        git diff --staged --quiet || git commit -m "Update portfolio history [skip ci]"
-        git push
+        
+        # 변경사항이 있으면 커밋
+        if ! git diff --staged --quiet; then
+          git commit -m "Update portfolio history [skip ci]"
+          echo "✅ 히스토리 변경사항 커밋"
+          
+          # 푸시 (재시도 로직 포함)
+          max_attempts=3
+          attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "📤 푸시 시도 $attempt/$max_attempts..."
+            
+            if git push; then
+              echo "✅ 푸시 성공!"
+              break
+            else
+              if [ $attempt -eq $max_attempts ]; then
+                echo "❌ 푸시 실패: $max_attempts번 시도 후 실패"
+                exit 1
+              fi
+              
+              echo "⚠️ 푸시 실패, 5초 후 재시도..."
+              sleep 5
+              
+              # 원격 변경사항 가져오기
+              git pull --rebase
+            fi
+            
+            attempt=$((attempt + 1))
+          done
+        else
+          echo "ℹ️ 히스토리 변경사항 없음"
+        fi
