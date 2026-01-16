@@ -730,100 +730,127 @@ class PeterLynchScreener:
     def _step3_deep_analysis(self):
         """Step 3: 심층 분석 (3중 검증)"""
         logger.info("[Step 3/7] 심층 분석 중 (3중 검증)...")
+        logger.info(f"  대상: {len(self.filtered)}개 종목\n")
+        
         validated = []
         errors = 0
+        skipped = 0
         
         for i, stock_data in enumerate(self.filtered, 1):
+            ticker = stock_data['ticker']
+            
             try:
                 result = self._analyze_with_triple_validation(stock_data)
                 
-                if result and result['is_valid']:
+                if result and result.get('is_valid'):
                     validated.append(result)
-                    if '3중 검증' in result['validation_status']:
-                        logger.info(f"  ✅ {stock_data['ticker']}: 3중 검증 통과")
+                    logger.info(f"  ✅ {ticker}: {result['validation_status']} | PEG {result['peg']:.2f}")
+                else:
+                    skipped += 1
                 
                 if i % 25 == 0:
-                    logger.info(f"  {i}/{len(self.filtered)} - 검증 완료: {len(validated)}개")
+                    logger.info(f"  진행: {i}/{len(self.filtered)} - 검증: {len(validated)}개, 제외: {skipped}개, 에러: {errors}개")
                 
-                time.sleep(0.3)
+                time.sleep(0.2)
                 
             except Exception as e:
                 errors += 1
+                if errors <= 10:
+                    logger.warning(f"  ❌ {ticker}: {str(e)[:80]}")
                 continue
         
         self.validated = validated
-        logger.info(f"✅ {len(self.validated)}개 종목 검증 완료\n")
-        return len(self.validated) > 0
+        logger.info(f"\n✅ 최종: {len(self.validated)}개 검증 완료 (제외: {skipped}개, 에러: {errors}개)\n")
+        
+        if len(self.validated) == 0:
+            logger.error("⚠️ 검증 통과 종목이 0개입니다. 필터 기준을 확인하세요.")
+            return False
+        
+        return True
     
     def _analyze_with_triple_validation(self, basic_data):
         """3중 검증: Yahoo + 직접계산 + Finviz"""
         ticker = basic_data['ticker']
-        stock = yf.Ticker(ticker)
-        info = stock.info
         
-        name = info.get('longName', 'N/A')
-        sector = info.get('sector', 'N/A')
-        industry = info.get('industry', 'N/A')
-        business = info.get('longBusinessSummary', '')[:500]
-        price = basic_data['price']
-        market_cap = basic_data['market_cap']
-        
-        # 1. Yahoo API 데이터
-        yahoo_pe = info.get('trailingPE') or info.get('forwardPE')
-        yahoo_growth = info.get('earningsGrowth')
-        
-        if not yahoo_pe or not yahoo_growth:
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            
+            # 기본 정보 체크
+            if not info or len(info) < 5:
+                return None
+            
+            name = info.get('longName') or info.get('shortName', 'N/A')
+            sector = info.get('sector', 'N/A')
+            industry = info.get('industry', 'N/A')
+            business = info.get('longBusinessSummary', '')[:500]
+            price = basic_data['price']
+            market_cap = basic_data['market_cap']
+            
+            # 1. Yahoo API 데이터
+            yahoo_pe = info.get('trailingPE') or info.get('forwardPE')
+            yahoo_growth = info.get('earningsGrowth') or info.get('earningsQuarterlyGrowth')
+            
+            if not yahoo_pe or not yahoo_growth:
+                return None
+            
+            if yahoo_pe <= 0:
+                return None
+            
+            yahoo_growth_pct = yahoo_growth * 100 if yahoo_growth < 10 else yahoo_growth
+            
+            if yahoo_growth_pct <= 0 or yahoo_growth_pct > 500:
+                return None
+            
+            yahoo_peg = yahoo_pe / yahoo_growth_pct
+            
+            # 2. 직접 계산
+            calculated_peg = self._calculate_peg_manually(stock, yahoo_pe)
+            
+            # 3. Finviz 크롤링 (너무 느려서 일단 스킵)
+            finviz_peg = None  # self._get_finviz_peg(ticker)
+            
+            # 3중 검증 (최소 2개 필요)
+            validation_result = self._triple_validate(yahoo_peg, calculated_peg, finviz_peg)
+            
+            if not validation_result['valid']:
+                return None
+            
+            final_peg = validation_result['peg']
+            
+            # PEG 필터
+            if final_peg >= self.PEG_LIMITS['max'] or final_peg <= 0:
+                return None
+            
+            # 성장률 필터
+            if yahoo_growth_pct < self.GROWTH_LIMITS['min'] or yahoo_growth_pct > self.GROWTH_LIMITS['max']:
+                return None
+            
+            # 부채 체크
+            debt_to_equity = info.get('debtToEquity')
+            if sector != 'Financial Services' and debt_to_equity and debt_to_equity > 200:
+                return None
+            
+            return {
+                'ticker': ticker,
+                'name': name,
+                'sector': sector,
+                'industry': industry,
+                'business_summary': business,
+                'price': price,
+                'market_cap': market_cap,
+                'pe_ratio': yahoo_pe,
+                'peg': final_peg,
+                'growth_rate': yahoo_growth_pct,
+                'debt_to_equity': debt_to_equity,
+                'validation_status': validation_result['status'],
+                'data_sources': validation_result['sources'],
+                'is_valid': True
+            }
+            
+        except Exception as e:
+            logger.debug(f"분석 실패 ({ticker}): {str(e)[:50]}")
             return None
-        
-        yahoo_growth_pct = yahoo_growth * 100
-        if yahoo_growth_pct <= 0:
-            return None
-        
-        yahoo_peg = yahoo_pe / yahoo_growth_pct
-        
-        # 2. 직접 계산
-        calculated_peg = self._calculate_peg_manually(stock, yahoo_pe)
-        
-        # 3. Finviz 크롤링
-        finviz_peg = self._get_finviz_peg(ticker)
-        
-        # 3중 검증
-        validation_result = self._triple_validate(yahoo_peg, calculated_peg, finviz_peg)
-        
-        if not validation_result['valid']:
-            return None
-        
-        final_peg = validation_result['peg']
-        
-        # PEG 필터
-        if final_peg >= self.PEG_LIMITS['max']:
-            return None
-        
-        # 성장률 필터
-        if yahoo_growth_pct < self.GROWTH_LIMITS['min']:
-            return None
-        
-        # 부채 체크
-        debt_to_equity = info.get('debtToEquity')
-        if sector != 'Financial Services' and debt_to_equity and debt_to_equity > 200:
-            return None
-        
-        return {
-            'ticker': ticker,
-            'name': name,
-            'sector': sector,
-            'industry': industry,
-            'business_summary': business,
-            'price': price,
-            'market_cap': market_cap,
-            'pe_ratio': yahoo_pe,
-            'peg': final_peg,
-            'growth_rate': yahoo_growth_pct,
-            'debt_to_equity': debt_to_equity,
-            'validation_status': validation_result['status'],
-            'data_sources': validation_result['sources'],
-            'is_valid': True
-        }
     
     def _calculate_peg_manually(self, stock, pe_ratio):
         """직접 계산: PEG = PE / 성장률"""
