@@ -409,7 +409,7 @@ class PeterLynchScreener:
         # 시가총액 설정
         # 안전 (대형주): 1_000_000_000 ($1B)
         # 공격 (소형주 Tenbagger): 100_000_000 ($100M) ← 피터 린치 추천!
-        self.MIN_MARKET_CAP = 1_000_000_000  # ← 여기 수정!
+        self.MIN_MARKET_CAP = 100_000_000  # ← 여기 수정!
         
         self.GROWTH_LIMITS = {'min': 15, 'ideal_min': 20, 'ideal_max': 50, 'max': 200}
         self.PEG_LIMITS = {'excellent': 0.5, 'good': 0.7, 'fair': 1.0, 'max': 1.5}
