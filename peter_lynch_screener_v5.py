@@ -1,6 +1,10 @@
 """
-피터 린치식 미국 주식 스크리닝 봇 V5.1 - Final (Safe Mode)
+피터 린치식 미국 주식 스크리닝 봇 V5.1 - Final (Bug Fix Ver)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+수정사항:
+- GPTAnalyzer의 KeyError('티커') 버그 수정
+- 데이터 키 매핑 (English keys) 통일
+
 기능:
 1. 속도 최적화 (fast_info 사용)
 2. 중국 주식 비중 10% 제한 (포트폴리오 당 1개)
@@ -68,10 +72,21 @@ class GPTAnalyzer:
         if not self.enabled: return "GPT API 키가 없습니다."
         
         prompt_text = "## 이번 주 추천 포트폴리오 (중국 비중 10% 제한 적용됨)\n"
+        
+        # [수정된 부분] s['티커'] -> s['ticker'] 로 변경 (데이터 내부 키 사용)
         for cat, stocks in categorized_stocks.items():
             prompt_text += f"\n[{cat.upper()}]\n"
             for s in stocks:
-                prompt_text += f"- {s['티커']} ({s['회사명']}): PEG {s['PEG']}, 성장률 {s['성장률(%)']}%\n"
+                try:
+                    # 영문 키를 사용하여 데이터 접근
+                    ticker = s.get('ticker', 'N/A')
+                    name = s.get('name', 'N/A')
+                    peg = s.get('peg', 0)
+                    growth = s.get('growth_rate', 0)
+                    
+                    prompt_text += f"- {ticker} ({name}): PEG {peg:.2f}, 성장률 {growth:.1f}%\n"
+                except Exception as e:
+                    continue
         
         prompt_text += "\n위 종목들에 대해 '1주차 3% 분할 매수' 관점에서 액션 플랜을 짧고 굵게 작성해줘. 소형주의 잠재력도 언급해줘."
 
@@ -93,7 +108,6 @@ class PortfolioHistoryManager:
     def __init__(self, history_file='portfolio_history.json', reset=False):
         self.history_file = history_file
         
-        # 여기서 reset=True일 때만 파일을 지웁니다.
         if reset and os.path.exists(self.history_file):
             os.remove(self.history_file)
             logger.info("🧹 기존 히스토리를 삭제하고 새로 시작합니다.")
@@ -115,7 +129,7 @@ class PortfolioHistoryManager:
 
     def update_from_portfolio(self, categorized_stocks):
         today = datetime.now().strftime("%Y-%m-%d")
-        all_recommended = [s['티커'] for cat in categorized_stocks.values() for s in cat]
+        all_recommended = [s['ticker'] for cat in categorized_stocks.values() for s in cat]
         
         # 기존 보유 종목 업데이트
         for ticker, info in self.history.items():
@@ -128,8 +142,7 @@ class PortfolioHistoryManager:
                 else:
                     logger.info(f"⚠️ {ticker}: 추천 제외됨 (관망 필요)")
         
-        # 신규 종목 추가 로직은 간소화를 위해 생략되었으나, 
-        # 실제로는 여기서 history 딕셔너리에 새로운 종목을 추가해야 다음 주에 '기존 종목'으로 인식합니다.
+        # 신규 종목 추가
         for ticker in all_recommended:
             if ticker not in self.history:
                 self.history[ticker] = {
@@ -163,7 +176,8 @@ class SlackSender:
             return
         try:
             self.client.chat_postMessage(channel=self.channel_id, text=message, mrkdwn=True)
-            self.client.files_upload_v2(channel=self.channel_id, file=file_path, title="투자 리포트")
+            if file_path and os.path.exists(file_path):
+                self.client.files_upload_v2(channel=self.channel_id, file=file_path, title="투자 리포트")
             logger.info("✅ 슬랙 전송 완료")
         except Exception as e:
             logger.error(f"슬랙 전송 실패: {e}")
@@ -279,7 +293,7 @@ class PeterLynchScreener:
 
     def _is_china_stock(self, stock):
         keywords = ['China', 'Chinese', 'Hong Kong', 'Macau', 'Beijing']
-        text = (stock['name'] + " " + stock['business_summary']).lower()
+        text = (stock.get('name', '') + " " + stock.get('business_summary', '')).lower()
         return any(k.lower() in text for k in keywords)
 
     def _step4_categorize(self):
@@ -287,6 +301,10 @@ class PeterLynchScreener:
         df = pd.DataFrame(self.validated)
         categorized = {'best_value': [], 'high_growth': [], 'balanced': []}
         
+        if df.empty:
+            logger.warning("❌ 통과된 종목이 없습니다.")
+            return False
+
         df = df.sort_values('peg')
         
         self.china_stock_count = 0
@@ -302,17 +320,18 @@ class PeterLynchScreener:
             limit = 2 if cat == 'balanced' else 4
             if len(categorized[cat]) >= limit: continue
             
-            if self._is_china_stock(row):
+            stock_dict = row.to_dict()
+            
+            if self._is_china_stock(stock_dict):
                 if self.china_stock_count >= MAX_CHINA: continue
                 self.china_stock_count += 1
-                row['name'] += " (🇨🇳China)"
+                stock_dict['name'] += " (🇨🇳China)"
             
-            korean_desc = self.gpt_analyzer.translate_to_korean(row['name'], row['business_summary'])
-            stock_data = row.to_dict()
-            stock_data['한글설명'] = korean_desc
-            stock_data['Yahoo'] = f"https://finance.yahoo.com/quote/{row['ticker']}"
+            korean_desc = self.gpt_analyzer.translate_to_korean(stock_dict['name'], stock_dict['business_summary'])
+            stock_dict['한글설명'] = korean_desc
+            stock_dict['Yahoo'] = f"https://finance.yahoo.com/quote/{stock_dict['ticker']}"
             
-            categorized[cat].append(stock_data)
+            categorized[cat].append(stock_dict)
             
             if sum(len(v) for v in categorized.values()) >= 10: break
             
@@ -329,8 +348,14 @@ class PeterLynchScreener:
         for cat, title in [('best_value', '🏆최고가치'), ('high_growth', '🚀고성장'), ('balanced', '⚖️균형')]:
             ws = wb.create_sheet(title)
             ws.append(['티커', '회사명', '한글설명', 'PEG', '성장률', '주가', 'Yahoo_Link'])
-            for s in self.categorized_stocks[cat]:
-                ws.append([s['ticker'], s['name'], s['한글설명'], round(s['peg'],2), round(s['growth_rate'],1), round(s['price'],2), s['Yahoo']])
+            
+            stocks = self.categorized_stocks.get(cat, [])
+            for s in stocks:
+                ws.append([
+                    s['ticker'], s['name'], s.get('한글설명', ''), 
+                    round(s['peg'],2), round(s['growth_rate'],1), 
+                    round(s['price'],2), s.get('Yahoo', '')
+                ])
         
         wb.save(filename)
         return filename
@@ -358,9 +383,9 @@ class PeterLynchScreener:
         self.slack_sender.send_report(message, filename)
 
 if __name__ == "__main__":
-    # reset_history=False (기본값): 히스토리를 유지함 (계속 기억함)
-    # 이번 한번만 초기화하고 싶으면:
-    # 1. 파일 탐색기에서 'portfolio_history.json' 파일을 삭제하세요.
-    # 2. 그리고 아래 코드를 그대로 실행하세요. 
+    # reset_history=False (기본값): 히스토리를 유지함.
+    # 이번 한번만 초기화하려면:
+    # 1. 터미널에서 `rm portfolio_history.json` 입력하거나,
+    # 2. 파일 탐색기에서 해당 파일 삭제 후 실행하세요.
     bot = PeterLynchScreener(reset_history=False)
     bot.run()
